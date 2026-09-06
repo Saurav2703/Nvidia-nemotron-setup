@@ -1,99 +1,154 @@
 #!/usr/bin/env bash
 ###############################################################################
-# setup-codex-nemotron-gitbash.sh   (Windows + Git Bash)
+# fix-codex-nemotron-wireapi.sh   (Windows + Git Bash)
 #
-# Installs OpenAI Codex CLI and points it DIRECTLY at NVIDIA's
-# OpenAI-compatible endpoint, so your coding agent runs on Nemotron.
-# No proxy needed — Codex speaks the OpenAI format natively.
+# Fixes: "Error loading config.toml: `wire_api = "chat"` is no longer
+#         supported. Set `wire_api = "responses"`"
 #
-#     Codex CLI -> https://integrate.api.nvidia.com/v1 -> Nemotron
+# Newer Codex CLI versions only speak the OpenAI *Responses* API.
+# This script:
+#   1) Tests whether NVIDIA's endpoint supports /v1/responses directly.
+#      -> If YES: rewrites ~/.codex/config.toml with wire_api="responses". Done.
+#   2) If NOT: installs a local LiteLLM proxy that exposes a Responses API
+#      and translates to NVIDIA's /chat/completions:
 #
-# Usage (in Git Bash):
-#   chmod +x setup-codex-nemotron-gitbash.sh
-#   ./setup-codex-nemotron-gitbash.sh
+#         Codex (responses) -> http://localhost:4000/v1 -> NVIDIA (chat)
+#
+# Usage (Git Bash):
+#   chmod +x fix-codex-nemotron-wireapi.sh
+#   ./fix-codex-nemotron-wireapi.sh
 ###############################################################################
 set -euo pipefail
 
 DEFAULT_MODEL="nvidia/nemotron-3-ultra-550b-a55b"
-INVOKE_BASE="https://integrate.api.nvidia.com/v1"
+NVIDIA_BASE="https://integrate.api.nvidia.com/v1"
 CODEX_HOME="$HOME/.codex"
 LAUNCH_DIR="$HOME/.codex-nemotron"
+PROXY_PORT=4000
 
 info()  { printf "\033[1;34m[INFO]\033[0m %s\n"  "$1"; }
 ok()    { printf "\033[1;32m[ OK ]\033[0m %s\n"  "$1"; }
 fail()  { printf "\033[1;31m[FAIL]\033[0m %s\n"  "$1"; exit 1; }
 
-case "$(uname -s)" in
-  MINGW*|MSYS*|CYGWIN*) : ;;
-  *) info "This looks like a non-Windows shell. Continuing anyway, but this script targets Git Bash on Windows." ;;
-esac
-
-# ---------------------------------------------------------------- user input
+# ---------------------------------------------------------------- inputs
 echo ""
 if [[ -n "${NVIDIA_API_KEY:-}" ]]; then
-  info "Using NVIDIA_API_KEY already set in your environment."
+  info "Using NVIDIA_API_KEY from your environment."
+elif [[ -f "$LAUNCH_DIR/env.sh" ]]; then
+  # Reuse the key saved by the previous setup script
+  # shellcheck disable=SC1090
+  source "$LAUNCH_DIR/env.sh"
+  info "Loaded NVIDIA_API_KEY from $LAUNCH_DIR/env.sh"
 else
   read -r -s -p "Paste your NVIDIA API key (nvapi-...): " NVIDIA_API_KEY
   echo ""
 fi
-[[ -n "$NVIDIA_API_KEY" ]] || fail "API key cannot be empty."
-[[ "$NVIDIA_API_KEY" == nvapi-* ]] || info "Key doesn't start with 'nvapi-' — continuing anyway, double-check it."
+[[ -n "${NVIDIA_API_KEY:-}" ]] || fail "API key cannot be empty."
 
 read -r -p "Model ID [default: $DEFAULT_MODEL]: " MODEL_ID
 MODEL_ID="${MODEL_ID:-$DEFAULT_MODEL}"
 
-# ---------------------------------------------------------------- Node.js
-if ! command -v node >/dev/null 2>&1; then
-  info "Node.js not found. Trying winget..."
-  if command -v winget.exe >/dev/null 2>&1; then
-    winget.exe install --id OpenJS.NodeJS.LTS -e --accept-source-agreements --accept-package-agreements || true
-    fail "Node.js was just installed. CLOSE this Git Bash window, open a NEW one, and re-run this script."
-  else
-    fail "Install Node.js LTS from https://nodejs.org, then re-run this script in a new Git Bash window."
+mkdir -p "$CODEX_HOME" "$LAUNCH_DIR"
+cat > "$LAUNCH_DIR/env.sh" <<EOF
+export NVIDIA_API_KEY="${NVIDIA_API_KEY}"
+EOF
+chmod 600 "$LAUNCH_DIR/env.sh"
+
+backup_config() {
+  if [[ -f "$CODEX_HOME/config.toml" ]]; then
+    cp "$CODEX_HOME/config.toml" "$CODEX_HOME/config.toml.bak.$(date +%Y%m%d%H%M%S)"
   fi
-fi
-ok "Node.js $(node --version) ready."
+}
 
-# ---------------------------------------------------------------- Codex CLI
-if ! command -v codex >/dev/null 2>&1; then
-  info "Installing OpenAI Codex CLI (@openai/codex)..."
-  npm install -g @openai/codex
-fi
-ok "Codex CLI installed."
+# ---------------------------------------------------------------- step 1: does NVIDIA speak Responses API?
+info "Testing whether NVIDIA supports the Responses API directly..."
+HTTP_CODE=$(curl -sS -o "$LAUNCH_DIR/responses-test.json" -w "%{http_code}" \
+  --request POST \
+  --url "${NVIDIA_BASE}/responses" \
+  --header "Authorization: Bearer ${NVIDIA_API_KEY}" \
+  --header "Content-Type: application/json" \
+  --data "{\"model\": \"${MODEL_ID}\", \"input\": \"Say OK\", \"max_output_tokens\": 16}" ) || true
 
-# ---------------------------------------------------------------- Codex config
-mkdir -p "$CODEX_HOME"
-
-# Back up any existing config rather than clobbering it
-if [[ -f "$CODEX_HOME/config.toml" ]]; then
-  BACKUP="$CODEX_HOME/config.toml.bak.$(date +%Y%m%d%H%M%S)"
-  cp "$CODEX_HOME/config.toml" "$BACKUP"
-  info "Existing Codex config backed up to: $BACKUP"
-fi
-
-info "Writing Codex config with NVIDIA as a custom model provider..."
-cat > "$CODEX_HOME/config.toml" <<EOF
-# Generated by setup-codex-nemotron-gitbash.sh
-# Docs: https://github.com/openai/codex (see docs/config.md for latest keys)
-
+if [[ "$HTTP_CODE" == "200" ]]; then
+  ok "NVIDIA supports /v1/responses directly (HTTP 200). No proxy needed!"
+  backup_config
+  cat > "$CODEX_HOME/config.toml" <<EOF
 model = "${MODEL_ID}"
 model_provider = "nvidia"
 
 [model_providers.nvidia]
 name = "NVIDIA NIM"
-base_url = "${INVOKE_BASE}"
+base_url = "${NVIDIA_BASE}"
 env_key = "NVIDIA_API_KEY"
-# NVIDIA NIM implements the classic Chat Completions API, not the Responses API
-wire_api = "chat"
+wire_api = "responses"
 EOF
-ok "Codex config written to $CODEX_HOME/config.toml"
+  ok "Rewrote $CODEX_HOME/config.toml with wire_api=\"responses\"."
+  echo ""
+  echo " Launch as before:  ~/.codex-nemotron/codex-nemotron.sh"
+  exit 0
+fi
 
-# ---------------------------------------------------------------- key storage + launcher
-mkdir -p "$LAUNCH_DIR"
-cat > "$LAUNCH_DIR/env.sh" <<EOF
-export NVIDIA_API_KEY="${NVIDIA_API_KEY}"
+info "NVIDIA returned HTTP ${HTTP_CODE} for /responses (details: $LAUNCH_DIR/responses-test.json)."
+info "Falling back to a local LiteLLM proxy that translates Responses -> Chat Completions."
+
+# ---------------------------------------------------------------- step 2: LiteLLM proxy fallback
+PYTHON_BIN=""
+for c in python py python3; do
+  if command -v "$c" >/dev/null 2>&1; then PYTHON_BIN="$c"; break; fi
+done
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v winget.exe >/dev/null 2>&1; then
+    winget.exe install --id Python.Python.3.12 -e --accept-source-agreements --accept-package-agreements || true
+    fail "Python was just installed. CLOSE this Git Bash window, open a NEW one, and re-run this script."
+  fi
+  fail "Install Python from https://python.org (check 'Add to PATH'), then re-run in a new Git Bash window."
+fi
+
+info "Installing LiteLLM into a virtualenv (this can take a minute)..."
+"$PYTHON_BIN" -m venv "$LAUNCH_DIR/venv"
+if [[ -x "$LAUNCH_DIR/venv/Scripts/pip.exe" ]]; then
+  VENV_PIP="$LAUNCH_DIR/venv/Scripts/pip.exe"
+  VENV_LITELLM="$LAUNCH_DIR/venv/Scripts/litellm.exe"
+else
+  VENV_PIP="$LAUNCH_DIR/venv/bin/pip"
+  VENV_LITELLM="$LAUNCH_DIR/venv/bin/litellm"
+fi
+"$VENV_PIP" install --quiet --upgrade pip
+"$VENV_PIP" install --quiet "litellm[proxy]"
+ok "LiteLLM installed."
+
+cat > "$LAUNCH_DIR/litellm-config.yaml" <<EOF
+model_list:
+  - model_name: ${MODEL_ID}
+    litellm_params:
+      model: openai/${MODEL_ID}
+      api_base: ${NVIDIA_BASE}
+      api_key: os.environ/NVIDIA_API_KEY
+      max_tokens: 16384
+
+litellm_settings:
+  drop_params: true
 EOF
-chmod 600 "$LAUNCH_DIR/env.sh"
+
+backup_config
+cat > "$CODEX_HOME/config.toml" <<EOF
+model = "${MODEL_ID}"
+model_provider = "nvidia_proxy"
+
+[model_providers.nvidia_proxy]
+name = "NVIDIA via LiteLLM"
+base_url = "http://localhost:${PROXY_PORT}/v1"
+env_key = "NVIDIA_API_KEY"
+wire_api = "responses"
+EOF
+ok "Rewrote $CODEX_HOME/config.toml to point at the local proxy."
+
+cat > "$LAUNCH_DIR/start-proxy.sh" <<EOF
+#!/usr/bin/env bash
+source "\$HOME/.codex-nemotron/env.sh"
+exec "$VENV_LITELLM" --config "\$HOME/.codex-nemotron/litellm-config.yaml" --port ${PROXY_PORT}
+EOF
+chmod +x "$LAUNCH_DIR/start-proxy.sh"
 
 cat > "$LAUNCH_DIR/codex-nemotron.sh" <<EOF
 #!/usr/bin/env bash
@@ -102,46 +157,17 @@ exec codex "\$@"
 EOF
 chmod +x "$LAUNCH_DIR/codex-nemotron.sh"
 
-# Optional convenience: offer to persist the key in ~/.bashrc so plain
-# 'codex' works in any Git Bash window without the wrapper.
-echo ""
-read -r -p "Also add NVIDIA_API_KEY to your ~/.bashrc so plain 'codex' works everywhere? [y/N]: " ADD_RC
-if [[ "${ADD_RC,,}" == "y" ]]; then
-  if ! grep -q "NVIDIA_API_KEY" "$HOME/.bashrc" 2>/dev/null; then
-    printf '\n# NVIDIA NIM key for Codex CLI\nexport NVIDIA_API_KEY="%s"\n' "$NVIDIA_API_KEY" >> "$HOME/.bashrc"
-    ok "Added to ~/.bashrc (takes effect in new Git Bash windows)."
-  else
-    info "~/.bashrc already mentions NVIDIA_API_KEY — left it untouched."
-  fi
-fi
-
-# ---------------------------------------------------------------- smoke test
-info "Testing your key against the NVIDIA endpoint..."
-HTTP_CODE=$(curl -sS -o "$LAUNCH_DIR/last-test.json" -w "%{http_code}" \
-  --request POST \
-  --url "${INVOKE_BASE}/chat/completions" \
-  --header "Authorization: Bearer ${NVIDIA_API_KEY}" \
-  --header "Content-Type: application/json" \
-  --data "{\"model\": \"${MODEL_ID}\", \"messages\": [{\"role\":\"user\",\"content\":\"Say OK\"}], \"max_tokens\": 10, \"stream\": false}" ) || true
-
-if [[ "$HTTP_CODE" == "200" ]]; then
-  ok "API key and model ID verified (HTTP 200)."
-else
-  info "Test call returned HTTP ${HTTP_CODE}. Response saved to $LAUNCH_DIR/last-test.json"
-  info "Common causes: wrong model ID, expired key, exhausted free credits. Config was still written."
-fi
-
-ok "Setup complete!"
+ok "Fix complete!"
 echo ""
 echo "─────────────────────────────────────────────────────────────"
-echo " HOW TO USE (Git Bash) — no proxy, single window"
+echo " HOW TO USE (proxy mode)"
 echo "─────────────────────────────────────────────────────────────"
-echo "   Launch Codex on Nemotron:"
-echo "     ~/.codex-nemotron/codex-nemotron.sh"
+echo " 1) Git Bash window #1 - start the proxy:"
+echo "      ~/.codex-nemotron/start-proxy.sh"
 echo ""
-echo "   (Or plain 'codex' if you added the key to ~/.bashrc.)"
+echo " 2) Git Bash window #2 - launch Codex on Nemotron:"
+echo "      ~/.codex-nemotron/codex-nemotron.sh"
 echo ""
-echo "   Change model later: edit 'model = ...' in ~/.codex/config.toml"
-echo "   If Codex errors on the config, its keys may have changed —"
-echo "   check https://github.com/openai/codex docs/config.md"
+echo " If Codex still errors, check your LiteLLM version supports"
+echo " the /v1/responses route:  $VENV_PIP install -U 'litellm[proxy]'"
 echo "─────────────────────────────────────────────────────────────"
